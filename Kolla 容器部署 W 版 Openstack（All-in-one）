@@ -1,0 +1,2431 @@
+ # Kolla 容器部署 W 版 Openstack（All-in-one）
+
+## 虚拟机的前期准备
+
+    vmware workstation
+    vmbox也可
+    不建议一来就用linux主机搞
+    ubuntu20.04
+    需要配置双网卡
+    ens33
+    ens36
+    ubuntu 设置 双网卡
+    一个网卡指定ip， 作为访问地址, 我这里是 10.131.165.195
+    一个网卡不指定ip ， 作为虚拟机访问外部的网卡
+
+vmware的配置
+
+    8G内存
+    4核Cpu
+
+    120G空间
+
+两张网卡
+
+### 前置安装
+
+你的用户必须是　root, 用以规避奇奇怪怪的权限问题
+
+#### 1. 安装python3 虚拟环境
+
+##### python  virtual env
+
+sudo apt install python3-pip
+
+sudo pip install virtualenv
+
+sudo pip install virtualenvwrapper
+
+sudo apt install python3-dev python3-venv libffi-dev gcc libssl-dev git
+
+
+安装完虚拟环境后，须配置环境变量
+
+如果提示找不到mkvirtualenv命令
+
+whereis virtualenvwrapper.sh
+
+/usr/local/bin/virtualenvwrapper.sh
+
+###### 1、创建目录用来存放虚拟环境
+
+mkdir $HOME/.virtualenvs
+
+###### 2、打开~/.bashrc 文件，并添加如下：
+
+```bash
+vim ~/.bashrc  # 如果终端是zsh, 那么　vim ~/.zshrc 
+```
+
+```bash
+# inset at end 
+export WORKON_HOME=$HOME/.virtualenvs
+# source /usr/bin/virtualenvwrapper.sh centos
+source /usr/local/bin/virtualenvwrapper.sh
+```
+
+```bash
+source ~/.bashrc　　# 使用配置生效，如果终端是zsh, 那么　source ~/.zshrc 
+```
+
+#### 2. 安装docker
+
+sudo apt update
+sudo apt install docker.io
+docker --version
+
+Docker version 20.10.7, build 20.10.7-0ubuntu5~20.04.2
+
+#### docker 换源
+如果不换源的话，使用　proxychians 代理
+
+修改 /etc/docker/daemon.json (如果该文件不存在，则创建)
+
+vim /etc/docker/daemon.json
+{
+	"registry-mirrors": [
+		"https://hub-mirror.c.163.com"
+	]
+}
+
+
+重启 docker 守护进程
+
+sudo systemctl restart docker
+查看是否生效
+
+docker info | grep -E "Registry|http"
+
+### 控制台走代理
+
+```bash
+# 安装 proxychains
+apt install proxychains
+# 安装v2ray
+# 修改 proxychains 端口
+vim /etc/proxychains.conf
+
+
+socks5 127.0.0.1 7890 # 这里需要替换为你自身的代理软件的地址和端口
+# 使用 proxychains 穿透
+
+proxychain4 curl google.com
+```
+
+### kolla && kolla-ansible
+
+kolla 编译服务的docker镜像
+kolla-ansible 用来部署各个环境，部署openstack
+
+
+
+#### kolla 镜像 编译
+
+#### 建立私有仓库（为deploy环节增加成功率，后续多节点部署也能方便很多）
+
+
+##### 配置Docker
+----------
+
+我们需要使用 manifest 功能进行混合架构容器镜像管理
+
+### 开启experimental功能
+
+新建`~/.docker/config.json`
+
+{
+    "experimental": "enabled"
+}
+
+##### 配置证书
+
+创建证书:
+
+    mkdir -p certs
+    openssl req \
+    -newkey rsa:4096 -nodes -sha256 -keyout certs/domain.key \
+    -x509 -addext "subjectAltName = DNS:registryserver,DNS:controller1" \
+    -days 3650 -out certs/domain.crt \
+    -subj "/C=CN/ST=Hhbei/L=WUHAN/O=CDS/OU=IT Department/CN=registryserver"
+
+> 确保CN使用主机名，例如 registryserver
+
+##### 运行Registry服务
+
+重启服务
+
+    systemctl daemon-reload
+    systemctl restart docker
+
+建立image仓库
+
+    mkdir /data
+    docker run -d \
+    --restart=always \
+    --name registry \
+    -v "$(pwd)"/certs:/certs \
+    -v /data/:/var/lib/registry \
+    -e REGISTRY_HTTP_ADDR=0.0.0.0:443 \
+    -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/domain.crt \
+    -e REGISTRY_HTTP_TLS_KEY=/certs/domain.key \
+    -p 4000:443 \
+    registry:2
+
+>  Docker Registry的镜像默认目录在删除容器后会自动删除，需要新建镜像目录如/data，
+>  并且在运行registry是映射到/var/lib/registry目录
+
+##### 拷贝证书
+
+自建证书domain.crt拷贝到所有节点 `/etc/docker/certs.d/registryserver:4000/ca.crt`
+
+mkdir /etc/docker/certs.d/
+mkdir /etc/docker/certs.d/registryserver:4000/
+
+
+cp certs/domain.crt /etc/docker/certs.d/registryserver:4000/ca.crt
+
+> registryserver替换为你使用的主机名
+
+#### 安装 kolla 用来编译docker 镜像
+git clone https://github.com/openstack/kolla
+
+
+cd kolla
+
+git checkout stable/wallaby # 切换制定openstack 版本, 宿主机u20.04 对应　w版，ｙ版，宿主机u22.04 对应的z(zed)版本
+
+mkvirtualenv ko # 创建python虚拟环境
+workon ko
+
+pip install -r requirements.txt ＃　安装ｐｙ的依赖
+python setup.py install
+
+
+### build images
+
+镜像服务分两部分，一部分是openstack自己运行的环境，一部分是 计算，存储，网络等云相关服务如下
+
+openstack 环境 镜像
+
+    memcached fluentdkolla-toolbox cron mongodb mariadb rabbitmq keepalived haproxy chrony iscsid tgtd
+
+openstack 服务镜像
+
+    placement 创建服务的服务
+    nova 计算服务
+    keystone 验证服务
+    glance 镜像服务 可设置为 ceph 后端
+    cinder 存储 可设置为  ceph后端
+    neutron 网络
+    horizon 网页dashboard
+    swift  存储相关，但是一般都不要这个服务了
+    ...
+
+> 如果需要编译所有的容器镜像，可以使用命令:
+mkdir /var/log/kolla/
+
+    kolla-build -t source -b ubuntu  memcached fluentd  placement kolla-toolbox cron mongodb mariadb rabbitmq keepalived haproxy chrony  heat iscsid tgtd  nova keystone glance cinder  neutron horizon swift --registry registryserver:4000 --tag 1.0.0 --logs-dir /var/log/kolla/ --namespace kolla --push
+
+-t source 表示从源代码编译
+-b ubuntu 表示用Ubuntu编译
+
+这里需要消耗一定时间, 小时计，可能得编译多次才能成功，最好用proxychains代理
+
+#### 
+1、在 /etc/docker/daemon.json 的解决办法：添加 insecure-registries 即可
+{
+  "registry-mirrors": ["https://1111.aliyuncs.com"],
+  "insecure-registries": ["registryserver:4000"]
+}
+
+#### 批量删除镜像
+
+如果想删除镜像
+
+docker rmi $(docker images | grep kolla/ubuntu  | grep tag | awk '{print $3}')
+
+
+docker rmi $(docker images | grep kolla/ubuntu )
+
+
+### 部署 openstack
+
+#### 修改host
+
+vim /etc/hosts
+
+```conf
+
+10.131.165.195 controller1
+10.131.165.195 registryserver
+
+```
+
+修改hostname 为 controller1
+
+不修改hostname，部署  rabbitmq会出错，导致所有服务跑不起来
+
+vim /etc/hostname
+
+```
+controller1
+```
+
+
+#### 安装 kolla-ansible
+
+git clone https://github.com/openstack/kolla-ansible.git
+
+cd kolla-ansible
+
+git checkout stable/wallaby # 切换制定openstack 版本
+mkvirtualenv ka # 创建python虚拟环境
+workon ka
+
+pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple　＃　安装ｐｙ的依赖
+pip install 'ansible<3.0'
+python setup.py install
+
+mkdir /etc/kolla/
+cp -r etc/kolla/* /etc/kolla/
+
+#### 部署参数配置
+
+部署核心配置文件有3个:
+
+* multinode 或者 allinone: 节点角色配置，例如控制节点，计算节点，存储节点
+* globals.yml: 云平台详细配置，例如网络配置，存储配置，服务配置等
+* passwords.yml: 云平台密码配置文件，例如数据库密码，云管理平台密码，服务密码等
+
+
+(ka2) root@luya-u22:~/kolla-ansible# ls /etc/kolla/
+config  globals.yml  multinode  passwords.yml
+
+生成密码
+
+```bash
+kolla-genpwd
+```
+
+为了后面登录方便，可以自定义keystone_admin_password密码，这里改为admin
+```bash
+
+# vi /etc/kolla/passwords.yml
+# keystone_admin_password:admin
+
+```
+
+安装 openstackclient
+
+pip install python-openstackclient==5.7
+
+kolla-ansible 执行命令是ssh方式
+所以执行部署前需要确认 部署的控制节点和计算节点ssh服务正常
+因为这是all-in-one 所以自已要能ssh到自己
+
+#### ubuntu 20.04 开启 22端口
+
+  sudo apt-get install openssh-server
+  sudo apt-get install ufw
+  sudo ufw enable
+  sudo ufw allow 22
+  sudo ufw allow 11211
+
+ 
+##### ubuntu 20.04 创建ssh私钥 允许root登陆
+
+ssh-keygen -C xxx
+
+cat ~/.ssh/id_rsa.pub
+
+查看ssh的端口：cat /etc/ssh/ssh_config
+vim /etc/ssh/sshd_config（root用户下）
+
+修改PermitRootLogin 这行，改为PermitRootLogin yes
+ 32 #PermitRootLogin prohibit-password
+ 33 PermitRootLogin yes
+
+vim ~/.ssh/authorized_keys
+systemctl restart sshd
+
+### kolla-ansible 部署云平台
+
+配置前请给服务器打上快照
+
+#### cinder后端配置
+
+通常测试后端使用lvm即可，ceph以及磁盘阵列后端配置可以参考官网文档。先测试lvm平台，保证平台功能没问题。
+
+如下将介绍lvm配置方法。
+
+cinder-volume运行在存储节点controller1上，我们需要在该节点上创建逻辑卷组(Volume Group)。有2种方式:
+
+* 通过文件创建
+* 通过物理磁盘创建
+
+##### 文件方式存储
+
+fdisk -l 
+
+
+fdisk: cannot open /dev/loop0: Permission denied
+fdisk: cannot open /dev/loop1: Permission denied
+fdisk: cannot open /dev/loop2: Permission denied
+fdisk: cannot open /dev/loop3: Permission denied
+fdisk: cannot open /dev/loop4: Permission denied
+fdisk: cannot open /dev/loop5: Permission denied
+...
+fdisk: cannot open /dev/loop16: Permission denied
+
+查看可用的loop标记位置，我这里看loop标记 到１５，所以文件块设置为loop16
+
+
+该方式由于性能较差，仅用于功能测试验证:
+
+    dd if=/dev/zero of=/var/lib/cinder_data.img bs=1G count=1 seek=10
+    sudo losetup /dev/loop16 /var/lib/cinder_data.img
+    pvcreate /dev/loop16
+    vgcreate cinder-volumes /dev/loop16
+
+##### 物理磁盘方式存储
+
+必须先给服务器挂载一个盘，/dev/sdb， 否则可能将系统损坏（如果你不知道这是什么意思，那你系统一定会被损坏）
+
+物理磁盘可以使用单个或者多个分区:
+
+    pvcreate /dev/sdb
+    vgcreate cinder-volumes /dev/sdb
+
+
+##### 核心文件配置
+
+大多时候，OpenStack平台搭建不起来大多是配置文件的问题
+
+以下是核心文件配置
+
+##### globals.yml
+
+vim /etc/kolla/globals.yml
+```yml
+    kolla_base_distro: "ubuntu"
+    kolla_install_type: "source"
+    # 云平台版本
+    #openstack_release: "1.0.0"
+    # 云平台访问浮动IP，单控制节点时为控制节点管理网络地址，三控时为控制网络没有使用的IP地址
+    kolla_internal_vip_address: "10.131.165.195"
+    docker_registry: "registryserver:4000"
+    # 云平台容器镜像所在的namespace，默认为kolla，按需修改
+    docker_namespace: "kolla"
+    # 管理网络网卡名称
+    network_interface: "ens36"
+    # L3网络外网网卡
+    neutron_external_interface: "ens33"
+    # 网桥模式，可选项openvswitch，linuxbridge
+    neutron_plugin_agent: "linuxbridge"
+    # keepalived虚拟router id，0..255，如果同一个2层网络有多个云，需要配置
+    # 不同的router id，否则不用配置
+    #keepalived_virtual_router_id: "51"
+    # console类型，可选项[ none, novnc, spice, rdp ]
+    #nova_console: "novnc"
+    # 开启时间同步服务
+    enable_chrony: "yes"
+    # 启动块存储服务
+    enable_cinder: "yes"
+    # cinder后端使用LVM时打开
+    enable_cinder_backend_iscsi: "yes"
+    # cinder后端使用LVM时打开
+    enable_cinder_backend_lvm: "yes"
+    enable_fluentd: "yes"
+
+    # 关闭horizon，默认开启
+    enable_horizon: "yes"
+    # 使用lvm时cinder后端volume group名称
+    cinder_volume_group: "cinder-volumes"
+```
+
+```yml
+###############
+# Kolla options
+###############
+# Valid options are [ COPY_ONCE, COPY_ALWAYS ]
+#config_strategy: "COPY_ALWAYS"
+
+# Valid options are ['centos', 'debian', 'rhel', 'ubuntu']
+kolla_base_distro: "ubuntu"
+
+# Valid options are [ binary, source ]
+kolla_install_type: "source"
+
+# Do not override this unless you know what you are doing.
+openstack_release: "1.0.0"
+
+# Docker image tag used by default.
+#openstack_tag: "{{ openstack_release ~ openstack_tag_suffix }}"
+
+# Suffix applied to openstack_release to generate openstack_tag.
+#openstack_tag_suffix: ""
+
+# Location of configuration overrides
+node_custom_config: "/etc/kolla/config"
+
+# This should be a VIP, an unused IP on your network that will float between
+# the hosts running keepalived for high-availability. If you want to run an
+# All-In-One without haproxy and keepalived, you can set enable_haproxy to no
+# in "OpenStack options" section, and set this value to the IP of your
+# 'network_interface' as set in the Networking section below.
+kolla_internal_vip_address: "10.131.165.195"
+
+
+################
+# Docker options
+################
+
+# Custom docker registry settings:
+docker_registry: "registryserver:4000"
+#docker_registry_insecure: "{{ 'yes' if docker_registry else 'no' }}"
+#docker_registry_username:
+# docker_registry_password is set in the passwords.yml file.
+
+# Namespace of images:
+docker_namespace: "kolla"
+
+##############################
+# Neutron - Networking Options
+##############################
+# This interface is what all your api services will be bound to by default.
+# Additionally, all vxlan/tunnel and storage network traffic will go over this
+# interface by default. This interface must contain an IP address.
+# It is possible for hosts to have non-matching names of interfaces - these can
+# be set in an inventory file per host or per group or stored separately, see
+#     http://docs.ansible.com/ansible/intro_inventory.html
+# Yet another way to workaround the naming problem is to create a bond for the
+# interface on all hosts and give the bond name here. Similar strategy can be
+# followed for other types of interfaces.
+network_interface: "ens38"
+
+
+# This is the raw interface given to neutron as its external network port. Even
+# though an IP address can exist on this interface, it will be unusable in most
+# configurations. It is recommended this interface not be configured with any IP
+# addresses for that reason.
+neutron_external_interface: "ens36"
+
+# Valid options are [ openvswitch, ovn, linuxbridge, vmware_nsxv, vmware_nsxv3, vmware_dvs ]
+# if vmware_nsxv3 is selected, enable_openvswitch MUST be set to "no" (default is yes)
+neutron_plugin_agent: "linuxbridge"
+
+###################
+# OpenStack options
+###################
+# Use these options to set the various log levels across all OpenStack projects
+# Valid options are [ True, False ]
+#openstack_logging_debug: "False"
+
+# Enable core OpenStack services. This includes:
+# glance, keystone, neutron, nova, heat, and horizon.
+enable_openstack_core: "yes"
+
+# OpenStack services can be enabled or disabled with these options
+
+enable_chrony: "no"
+enable_cinder: "yes"
+#enable_cinder_backup: "yes"
+enable_cinder_backend_lvm: "yes"
+
+enable_fluentd: "yes"
+
+enable_horizon: "yes"
+
+#############################
+# Keystone - Identity Options
+#############################
+
+# Valid options are [ fernet ]
+#keystone_token_provider: 'fernet'
+
+#keystone_admin_user: "admin"
+
+#keystone_admin_project: "admin"
+
+# Interval to rotate fernet keys by (in seconds). Must be an interval of
+# 60(1 min), 120(2 min), 180(3 min), 240(4 min), 300(5 min), 360(6 min),
+# 600(10 min), 720(12 min), 900(15 min), 1200(20 min), 1800(30 min),
+# 3600(1 hour), 7200(2 hour), 10800(3 hour), 14400(4 hour), 21600(6 hour),
+# 28800(8 hour), 43200(12 hour), 86400(1 day), 604800(1 week).
+#fernet_token_expiry: 86400
+
+
+################################
+# Cinder - Block Storage Options
+################################
+
+cinder_volume_group: "cinder-volumes"
+
+
+########################
+# Nova - Compute Options
+########################
+
+nova_compute_virt_type: "qemu"
+nova_console: "novnc"
+```
+
+```yml
+# You can use this file to override _any_ variable throughout Kolla.
+# Additional options can be found in the
+# 'kolla-ansible/ansible/group_vars/all.yml' file. Default value of all the
+# commented parameters are shown here, To override the default value uncomment
+# the parameter and change its value.
+
+###################
+# Ansible options
+###################
+
+# This variable is used as the "filter" argument for the setup module.  For
+# instance, if one wants to remove/ignore all Neutron interface facts:
+# kolla_ansible_setup_filter: "ansible_[!qt]*"
+# By default, we do not provide a filter.
+#kolla_ansible_setup_filter: "{{ omit }}"
+
+# This variable is used as the "gather_subset" argument for the setup module.
+# For instance, if one wants to avoid collecting facts via facter:
+# kolla_ansible_setup_gather_subset: "all,!facter"
+# By default, we do not provide a gather subset.
+#kolla_ansible_setup_gather_subset: "{{ omit }}"
+
+###############
+# Kolla options
+###############
+# Valid options are [ COPY_ONCE, COPY_ALWAYS ]
+#config_strategy: "COPY_ALWAYS"
+
+# Valid options are ['centos', 'debian', 'rhel', 'ubuntu']
+kolla_base_distro: "ubuntu"
+
+# Valid options are [ binary, source ]
+kolla_install_type: "source"
+
+# Do not override this unless you know what you are doing.
+openstack_release: "1.0.0"
+
+# Docker image tag used by default.
+#openstack_tag: "{{ openstack_release ~ openstack_tag_suffix }}"
+
+# Suffix applied to openstack_release to generate openstack_tag.
+#openstack_tag_suffix: ""
+
+# Location of configuration overrides
+node_custom_config: "/etc/kolla/config"
+
+# This should be a VIP, an unused IP on your network that will float between
+# the hosts running keepalived for high-availability. If you want to run an
+# All-In-One without haproxy and keepalived, you can set enable_haproxy to no
+# in "OpenStack options" section, and set this value to the IP of your
+# 'network_interface' as set in the Networking section below.
+kolla_internal_vip_address: "10.131.165.195"
+
+# This is the DNS name that maps to the kolla_internal_vip_address VIP. By
+# default it is the same as kolla_internal_vip_address.
+#kolla_internal_fqdn: "{{ kolla_internal_vip_address }}"
+
+# This should be a VIP, an unused IP on your network that will float between
+# the hosts running keepalived for high-availability. It defaults to the
+# kolla_internal_vip_address, allowing internal and external communication to
+# share the same address.  Specify a kolla_external_vip_address to separate
+# internal and external requests between two VIPs.
+#kolla_external_vip_address: "{{ kolla_internal_vip_address }}"
+
+# The Public address used to communicate with OpenStack as set in the public_url
+# for the endpoints that will be created. This DNS name should map to
+# kolla_external_vip_address.
+#kolla_external_fqdn: "{{ kolla_external_vip_address }}"
+
+# Optionally change the path to sysctl.conf modified by Kolla Ansible plays.
+#kolla_sysctl_conf_path: /etc/sysctl.conf
+
+################
+# Docker options
+################
+
+# Custom docker registry settings:
+docker_registry: "registryserver:4000"
+#docker_registry_insecure: "{{ 'yes' if docker_registry else 'no' }}"
+#docker_registry_username:
+# docker_registry_password is set in the passwords.yml file.
+
+# Namespace of images:
+docker_namespace: "kolla"
+
+# Docker client timeout in seconds.
+#docker_client_timeout: 120
+
+#docker_configure_for_zun: "no"
+#containerd_configure_for_zun: "no"
+#containerd_grpc_gid: 42463
+
+###################
+# Messaging options
+###################
+# Below is an example of an separate backend that provides brokerless
+# messaging for oslo.messaging RPC communications
+
+#om_rpc_transport: "amqp"
+#om_rpc_user: "{{ qdrouterd_user }}"
+#om_rpc_password: "{{ qdrouterd_password }}"
+#om_rpc_port: "{{ qdrouterd_port }}"
+#om_rpc_group: "qdrouterd"
+
+# Whether to enable TLS for oslo.messaging communication with RabbitMQ.
+#om_enable_rabbitmq_tls: "{{ rabbitmq_enable_tls | bool }}"
+# CA certificate bundle in containers using oslo.messaging with RabbitMQ TLS.
+#om_rabbitmq_cacert: "{{ rabbitmq_cacert }}"
+
+##############################
+# Neutron - Networking Options
+##############################
+# This interface is what all your api services will be bound to by default.
+# Additionally, all vxlan/tunnel and storage network traffic will go over this
+# interface by default. This interface must contain an IP address.
+# It is possible for hosts to have non-matching names of interfaces - these can
+# be set in an inventory file per host or per group or stored separately, see
+#     http://docs.ansible.com/ansible/intro_inventory.html
+# Yet another way to workaround the naming problem is to create a bond for the
+# interface on all hosts and give the bond name here. Similar strategy can be
+# followed for other types of interfaces.
+network_interface: "ens38"
+
+# These can be adjusted for even more customization. The default is the same as
+# the 'network_interface'. These interfaces must contain an IP address.
+# kolla_external_vip_interface: "ens36"
+#api_interface: "{{ network_interface }}"
+#storage_interface: "{{ network_interface }}"
+#swift_storage_interface: "{{ storage_interface }}"
+#swift_replication_interface: "{{ swift_storage_interface }}"
+#tunnel_interface: "{{ network_interface }}"
+#dns_interface: "{{ network_interface }}"
+#octavia_network_interface: "{{ api_interface }}"
+
+# Configure the address family (AF) per network.
+# Valid options are [ ipv4, ipv6 ]
+#network_address_family: "ipv4"
+#api_address_family: "{{ network_address_family }}"
+#storage_address_family: "{{ network_address_family }}"
+#swift_storage_address_family: "{{ storage_address_family }}"
+#swift_replication_address_family: "{{ swift_storage_address_family }}"
+#migration_address_family: "{{ api_address_family }}"
+#tunnel_address_family: "{{ network_address_family }}"
+#octavia_network_address_family: "{{ api_address_family }}"
+#bifrost_network_address_family: "{{ network_address_family }}"
+#dns_address_family: "{{ network_address_family }}"
+
+# This is the raw interface given to neutron as its external network port. Even
+# though an IP address can exist on this interface, it will be unusable in most
+# configurations. It is recommended this interface not be configured with any IP
+# addresses for that reason.
+neutron_external_interface: "ens36"
+
+# Valid options are [ openvswitch, ovn, linuxbridge, vmware_nsxv, vmware_nsxv3, vmware_dvs ]
+# if vmware_nsxv3 is selected, enable_openvswitch MUST be set to "no" (default is yes)
+neutron_plugin_agent: "linuxbridge"
+
+# Valid options are [ internal, infoblox ]
+#neutron_ipam_driver: "internal"
+
+# Configure Neutron upgrade option, currently Kolla support
+# two upgrade ways for Neutron: legacy_upgrade and rolling_upgrade
+# The variable "neutron_enable_rolling_upgrade: yes" is meaning rolling_upgrade
+# were enabled and opposite
+# Neutron rolling upgrade were enable by default
+#neutron_enable_rolling_upgrade: "yes"
+
+
+####################
+# keepalived options
+####################
+# Arbitrary unique number from 0..255
+# This should be changed from the default in the event of a multi-region deployment
+# where the VIPs of different regions reside on a common subnet.
+#keepalived_virtual_router_id: "51"
+
+###################
+# Dimension options
+###################
+# This is to provide an extra option to deploy containers with Resource constraints.
+# We call it dimensions here.
+# The dimensions for each container are defined by a mapping, where each dimension value should be a
+# string.
+# Reference_Docs
+# https://docs.docker.com/config/containers/resource_constraints/
+# eg:
+# <container_name>_dimensions:
+#    blkio_weight:
+#    cpu_period:
+#    cpu_quota:
+#    cpu_shares:
+#    cpuset_cpus:
+#    cpuset_mems:
+#    mem_limit:
+#    mem_reservation:
+#    memswap_limit:
+#    kernel_memory:
+#    ulimits:
+
+#####################
+# Healthcheck options
+#####################
+#enable_container_healthchecks: "yes"
+# Healthcheck options for Docker containers
+# interval/timeout/start_period are in seconds
+#default_container_healthcheck_interval: 30
+#default_container_healthcheck_timeout: 30
+#default_container_healthcheck_retries: 3
+#default_container_healthcheck_start_period: 5
+
+
+#############
+# TLS options
+#############
+# To provide encryption and authentication on the kolla_external_vip_interface,
+# TLS can be enabled.  When TLS is enabled, certificates must be provided to
+# allow clients to perform authentication.
+#kolla_enable_tls_internal: "no"
+#kolla_enable_tls_external: "{{ kolla_enable_tls_internal if kolla_same_external_internal_vip | bool else 'no' }}"
+#kolla_certificates_dir: "{{ node_config }}/certificates"
+#kolla_external_fqdn_cert: "{{ kolla_certificates_dir }}/haproxy.pem"
+#kolla_internal_fqdn_cert: "{{ kolla_certificates_dir }}/haproxy-internal.pem"
+#kolla_admin_openrc_cacert: ""
+#kolla_copy_ca_into_containers: "no"
+#haproxy_backend_cacert: "{{ 'ca-certificates.crt' if kolla_base_distro in ['debian', 'ubuntu'] else 'ca-bundle.trust.crt' }}"
+#haproxy_backend_cacert_dir: "/etc/ssl/certs"
+
+##################
+# Backend options
+##################
+#kolla_httpd_keep_alive: "60"
+#kolla_httpd_timeout: "60"
+
+#####################
+# Backend TLS options
+#####################
+#kolla_enable_tls_backend: "no"
+#kolla_verify_tls_backend: "yes"
+#kolla_tls_backend_cert: "{{ kolla_certificates_dir }}/backend-cert.pem"
+#kolla_tls_backend_key: "{{ kolla_certificates_dir }}/backend-key.pem"
+
+#####################
+# ACME client options
+#####################
+# A list of haproxy backend server directives pointing to addresses used by the
+# ACME client to complete http-01 challenge.
+# Please read the docs for more details.
+#acme_client_servers: []
+
+################
+# Region options
+################
+# Use this option to change the name of this region.
+#openstack_region_name: "RegionOne"
+
+# Use this option to define a list of region names - only needs to be configured
+# in a multi-region deployment, and then only in the *first* region.
+#multiple_regions_names: ["{{ openstack_region_name }}"]
+
+###################
+# OpenStack options
+###################
+# Use these options to set the various log levels across all OpenStack projects
+# Valid options are [ True, False ]
+#openstack_logging_debug: "False"
+
+# Enable core OpenStack services. This includes:
+# glance, keystone, neutron, nova, heat, and horizon.
+enable_openstack_core: "yes"
+
+# These roles are required for Kolla to be operation, however a savvy deployer
+# could disable some of these required roles and run their own services.
+#enable_glance: "{{ enable_openstack_core | bool }}"
+#enable_hacluster: "no"
+#enable_haproxy: "yes"
+#enable_keepalived: "{{ enable_haproxy | bool }}"
+#enable_keystone: "{{ enable_openstack_core | bool }}"
+#enable_mariadb: "yes"
+#enable_memcached: "yes"
+#enable_neutron: "{{ enable_openstack_core | bool }}"
+#enable_nova: "{{ enable_openstack_core | bool }}"
+#enable_rabbitmq: "{{ 'yes' if om_rpc_transport == 'rabbit' or om_notify_transport == 'rabbit' else 'no' }}"
+#enable_outward_rabbitmq: "{{ enable_murano | bool }}"
+
+# OpenStack services can be enabled or disabled with these options
+#enable_aodh: "no"
+#enable_barbican: "no"
+#enable_blazar: "no"
+#enable_ceilometer: "no"
+#enable_ceilometer_ipmi: "no"
+#enable_cells: "no"
+#enable_central_logging: "no"
+enable_chrony: "no"
+enable_cinder: "yes"
+#enable_cinder_backup: "yes"
+#enable_cinder_backend_hnas_nfs: "no"
+#enable_cinder_backend_iscsi: "{{ enable_cinder_backend_lvm | bool }}"
+enable_cinder_backend_lvm: "yes"
+#enable_cinder_backend_nfs: "no"
+#enable_cinder_backend_quobyte: "no"
+#enable_cloudkitty: "no"
+#enable_collectd: "no"
+#enable_cyborg: "no"
+#enable_designate: "no"
+#enable_destroy_images: "no"
+#enable_elasticsearch: "{{ 'yes' if enable_central_logging | bool or enable_osprofiler | bool or enable_skydive | bool or enable_monasca | bool or (enable_cloudkitty | bool and cloudkitty_storage_backend == 'elasticsearch') else 'no' }}"
+#enable_elasticsearch_curator: "no"
+#enable_etcd: "no"
+enable_fluentd: "yes"
+#enable_freezer: "no"
+#enable_gnocchi: "no"
+#enable_gnocchi_statsd: "no"
+#enable_grafana: "{{ enable_monasca | bool }}"
+#enable_heat: "{{ enable_openstack_core | bool }}"
+enable_horizon: "yes"
+#enable_horizon_blazar: "{{ enable_blazar | bool }}"
+#enable_horizon_cloudkitty: "{{ enable_cloudkitty | bool }}"
+#enable_horizon_designate: "{{ enable_designate | bool }}"
+#enable_horizon_freezer: "{{ enable_freezer | bool }}"
+#enable_horizon_heat: "{{ enable_heat | bool }}"
+#enable_horizon_ironic: "{{ enable_ironic | bool }}"
+#enable_horizon_magnum: "{{ enable_magnum | bool }}"
+#enable_horizon_manila: "{{ enable_manila | bool }}"
+#enable_horizon_masakari: "{{ enable_masakari | bool }}"
+#enable_horizon_mistral: "{{ enable_mistral | bool }}"
+#enable_horizon_monasca: "{{ enable_monasca | bool }}"
+#enable_horizon_murano: "{{ enable_murano | bool }}"
+#enable_horizon_neutron_vpnaas: "{{ enable_neutron_vpnaas | bool }}"
+#enable_horizon_octavia: "{{ enable_octavia | bool }}"
+#enable_horizon_sahara: "{{ enable_sahara | bool }}"
+#enable_horizon_senlin: "{{ enable_senlin | bool }}"
+#enable_horizon_solum: "{{ enable_solum | bool }}"
+#enable_horizon_tacker: "{{ enable_tacker | bool }}"
+#enable_horizon_trove: "{{ enable_trove | bool }}"
+#enable_horizon_vitrage: "{{ enable_vitrage | bool }}"
+#enable_horizon_watcher: "{{ enable_watcher | bool }}"
+#enable_horizon_zun: "{{ enable_zun | bool }}"
+#enable_influxdb: "{{ enable_monasca | bool or (enable_cloudkitty | bool and cloudkitty_storage_backend == 'influxdb') }}"
+#enable_ironic: "no"
+#enable_ironic_ipxe: "no"
+#enable_ironic_neutron_agent: "{{ enable_neutron | bool and enable_ironic | bool }}"
+#enable_ironic_pxe_uefi: "no"
+#enable_iscsid: "{{ (enable_cinder | bool and enable_cinder_backend_iscsi | bool) or enable_ironic | bool }}"
+#enable_kafka: "{{ enable_monasca | bool }}"
+#enable_kibana: "{{ 'yes' if enable_central_logging | bool or enable_monasca | bool else 'no' }}"
+#enable_kuryr: "no"
+#enable_magnum: "no"
+#enable_manila: "no"
+#enable_manila_backend_generic: "no"
+#enable_manila_backend_hnas: "no"
+#enable_manila_backend_cephfs_native: "no"
+#enable_manila_backend_cephfs_nfs: "no"
+#enable_manila_backend_glusterfs_nfs: "no"
+#enable_mariabackup: "no"
+#enable_masakari: "no"
+#enable_mistral: "no"
+#enable_monasca: "no"
+#enable_multipathd: "no"
+#enable_murano: "no"
+#enable_neutron_vpnaas: "no"
+#enable_neutron_sriov: "no"
+#enable_neutron_dvr: "no"
+#enable_neutron_qos: "no"
+#enable_neutron_agent_ha: "no"
+#enable_neutron_bgp_dragent: "no"
+#enable_neutron_provider_networks: "no"
+#enable_neutron_segments: "no"
+#enable_neutron_sfc: "no"
+#enable_neutron_trunk: "no"
+#enable_neutron_metering: "no"
+#enable_neutron_infoblox_ipam_agent: "no"
+#enable_neutron_port_forwarding: "no"
+#enable_nova_serialconsole_proxy: "no"
+#enable_nova_ssh: "yes"
+#enable_octavia: "no"
+#enable_octavia_driver_agent: "{{ enable_octavia | bool and neutron_plugin_agent == 'ovn' }}"
+#enable_openvswitch: "{{ enable_neutron | bool and neutron_plugin_agent != 'linuxbridge' }}"
+#enable_ovn: "{{ enable_neutron | bool and neutron_plugin_agent == 'ovn' }}"
+#enable_ovs_dpdk: "no"
+#enable_osprofiler: "no"
+#enable_panko: "no"
+#enable_placement: "{{ enable_nova | bool or enable_zun | bool }}"
+#enable_prometheus: "no"
+#enable_qdrouterd: "{{ 'yes' if om_rpc_transport == 'amqp' else 'no' }}"
+#enable_rally: "no"
+#enable_redis: "no"
+#enable_sahara: "no"
+#enable_senlin: "no"
+#enable_skydive: "no"
+#enable_solum: "no"
+#enable_storm: "{{ enable_monasca | bool }}"
+#enable_swift: "no"
+#enable_swift_s3api: "no"
+#enable_tacker: "no"
+#enable_telegraf: "no"
+#enable_tempest: "no"
+#enable_trove: "no"
+#enable_trove_singletenant: "no"
+#enable_vitrage: "no"
+#enable_vmtp: "no"
+#enable_watcher: "no"
+#enable_zookeeper: "{{ enable_kafka | bool or enable_storm | bool }}"
+#enable_zun: "no"
+
+##################
+# RabbitMQ options
+##################
+# Options passed to RabbitMQ server startup script via the
+# RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS environment var.
+# See Kolla Ansible docs RabbitMQ section for details.
+# These are appended to args already provided by Kolla Ansible
+# to configure IPv6 in RabbitMQ server.
+# More details can be found in the RabbitMQ docs:
+# https://www.rabbitmq.com/runtime.html#scheduling
+# https://www.rabbitmq.com/runtime.html#busy-waiting
+# The default tells RabbitMQ to always use two cores (+S 2:2),
+# and not to busy wait (+sbwt none +sbwtdcpu none +sbwtdio none):
+#rabbitmq_server_additional_erl_args: "+S 2:2 +sbwt none +sbwtdcpu none +sbwtdio none"
+# Whether to enable TLS encryption for RabbitMQ client-server communication.
+#rabbitmq_enable_tls: "no"
+# CA certificate bundle in RabbitMQ container.
+#rabbitmq_cacert: "/etc/ssl/certs/{{ 'ca-certificates.crt' if kolla_base_distro in ['debian', 'ubuntu'] else 'ca-bundle.trust.crt' }}"
+
+#################
+# MariaDB options
+#################
+# List of additional WSREP options
+#mariadb_wsrep_extra_provider_options: []
+
+#######################
+# External Ceph options
+#######################
+# External Ceph - cephx auth enabled (this is the standard nowadays, defaults to yes)
+#external_ceph_cephx_enabled: "yes"
+
+# Glance
+#ceph_glance_keyring: "ceph.client.glance.keyring"
+#ceph_glance_user: "glance"
+#ceph_glance_pool_name: "images"
+# Cinder
+#ceph_cinder_keyring: "ceph.client.cinder.keyring"
+#ceph_cinder_user: "cinder"
+#ceph_cinder_pool_name: "volumes"
+#ceph_cinder_backup_keyring: "ceph.client.cinder-backup.keyring"
+#ceph_cinder_backup_user: "cinder-backup"
+#ceph_cinder_backup_pool_name: "backups"
+# Nova
+#ceph_nova_keyring: "{{ ceph_cinder_keyring }}"
+#ceph_nova_user: "nova"
+#ceph_nova_pool_name: "vms"
+# Gnocchi
+#ceph_gnocchi_keyring: "ceph.client.gnocchi.keyring"
+#ceph_gnocchi_user: "gnocchi"
+#ceph_gnocchi_pool_name: "gnocchi"
+# Manila
+#ceph_manila_keyring: "ceph.client.manila.keyring"
+#ceph_manila_user: "manila"
+
+#############################
+# Keystone - Identity Options
+#############################
+
+# Valid options are [ fernet ]
+#keystone_token_provider: 'fernet'
+
+#keystone_admin_user: "admin"
+
+#keystone_admin_project: "admin"
+
+# Interval to rotate fernet keys by (in seconds). Must be an interval of
+# 60(1 min), 120(2 min), 180(3 min), 240(4 min), 300(5 min), 360(6 min),
+# 600(10 min), 720(12 min), 900(15 min), 1200(20 min), 1800(30 min),
+# 3600(1 hour), 7200(2 hour), 10800(3 hour), 14400(4 hour), 21600(6 hour),
+# 28800(8 hour), 43200(12 hour), 86400(1 day), 604800(1 week).
+#fernet_token_expiry: 86400
+
+
+########################
+# Glance - Image Options
+########################
+# Configure image backend.
+#glance_backend_ceph: "no"
+#glance_backend_file: "yes"
+#glance_backend_swift: "no"
+#glance_backend_vmware: "no"
+#enable_glance_image_cache: "no"
+#glance_enable_property_protection: "no"
+#glance_enable_interoperable_image_import: "no"
+# Configure glance upgrade option.
+# Due to this feature being experimental in glance,
+# the default value is "no".
+#glance_enable_rolling_upgrade: "no"
+
+####################
+# Osprofiler options
+####################
+# valid values: ["elasticsearch", "redis"]
+#osprofiler_backend: "elasticsearch"
+
+##################
+# Barbican options
+##################
+# Valid options are [ simple_crypto, p11_crypto ]
+#barbican_crypto_plugin: "simple_crypto"
+#barbican_library_path: "/usr/lib/libCryptoki2_64.so"
+
+#################
+# Gnocchi options
+#################
+# Valid options are [ file, ceph, swift ]
+#gnocchi_backend_storage: "{% if enable_swift | bool %}swift{% else %}file{% endif %}"
+
+# Valid options are [redis, '']
+#gnocchi_incoming_storage: "{{ 'redis' if enable_redis | bool else '' }}"
+
+################################
+# Cinder - Block Storage Options
+################################
+# Enable / disable Cinder backends
+#cinder_backend_ceph: "no"
+#cinder_backend_vmwarevc_vmdk: "no"
+cinder_volume_group: "cinder-volumes"
+# Valid options are [ '', redis, etcd ]
+#cinder_coordination_backend: "{{ 'redis' if enable_redis|bool else 'etcd' if enable_etcd|bool else '' }}"
+
+# Valid options are [ nfs, swift, ceph ]
+#cinder_backup_driver: "ceph"
+#cinder_backup_share: ""
+#cinder_backup_mount_options_nfs: ""
+
+#######################
+# Cloudkitty options
+#######################
+# Valid option is gnocchi
+#cloudkitty_collector_backend: "gnocchi"
+# Valid options are 'sqlalchemy' or 'influxdb'. The default value is
+# 'influxdb', which matches the default in Cloudkitty since the Stein release.
+# When the backend is "influxdb", we also enable Influxdb.
+# Also, when using 'influxdb' as the backend, we trigger the configuration/use
+# of Cloudkitty storage backend version 2.
+#cloudkitty_storage_backend: "influxdb"
+
+###################
+# Designate options
+###################
+# Valid options are [ bind9 ]
+#designate_backend: "bind9"
+#designate_ns_record: "sample.openstack.org"
+# Valid options are [ '', redis ]
+#designate_coordination_backend: "{{ 'redis' if enable_redis|bool else '' }}"
+
+########################
+# Nova - Compute Options
+########################
+#nova_backend_ceph: "no"
+
+# Valid options are [ qemu, kvm, vmware ]
+#nova_compute_virt_type: "kvm"
+
+# The number of fake driver per compute node
+#num_nova_fake_per_node: 5
+
+# The flag "nova_safety_upgrade" need to be consider when
+# "nova_enable_rolling_upgrade" is enabled. The "nova_safety_upgrade"
+# controls whether the nova services are all stopped before rolling
+# upgrade to the new version, for the safety and availability.
+# If "nova_safety_upgrade" is "yes", that will stop all nova services (except
+# nova-compute) for no failed API operations before upgrade to the
+# new version. And opposite.
+#nova_safety_upgrade: "no"
+
+# Valid options are [ none, novnc, spice ]
+nova_console: "novnc"
+
+##############################
+# Neutron - networking options
+##############################
+# Enable distributed floating ip for OVN deployments
+#neutron_ovn_distributed_fip: "no"
+
+# Enable DHCP agent(s) to use with OVN
+#neutron_ovn_dhcp_agent: "no"
+
+#############################
+# Horizon - Dashboard Options
+#############################
+#horizon_backend_database: "{{ enable_murano | bool }}"
+
+#############################
+# Ironic options
+#############################
+# dnsmasq bind interface for Ironic Inspector, by default is network_interface
+#ironic_dnsmasq_interface: "{{ network_interface }}"
+# The following value must be set when enabling ironic, the value format is
+# "192.168.0.10,192.168.0.100,255.255.255.0" the last being an optional netmask.
+#ironic_dnsmasq_dhcp_range:
+# PXE bootloader file for Ironic Inspector, relative to /tftpboot.
+#ironic_dnsmasq_boot_file: "pxelinux.0"
+
+# Configure ironic upgrade option, due to currently kolla support
+# two upgrade ways for ironic: legacy_upgrade and rolling_upgrade
+# The variable "ironic_enable_rolling_upgrade: yes" is meaning rolling_upgrade
+# were enabled and opposite
+# Rolling upgrade were enable by default
+#ironic_enable_rolling_upgrade: "yes"
+
+# List of extra kernel parameters passed to the kernel used during inspection
+#ironic_inspector_kernel_cmdline_extras: []
+
+######################################
+# Manila - Shared File Systems Options
+######################################
+# HNAS backend configuration
+#hnas_ip:
+#hnas_user:
+#hnas_password:
+#hnas_evs_id:
+#hnas_evs_ip:
+#hnas_file_system_name:
+
+# CephFS backend configuration.
+# External Ceph FS name.
+# By default this is empty to allow Manila to auto-find the first FS available.
+#manila_cephfs_filesystem_name:
+
+# Gluster backend configuration
+# The option of glusterfs share layout can be directory or volume
+# The default option of share layout is 'volume'
+#manila_glusterfs_share_layout:
+# The default option of nfs server type is 'Gluster'
+#manila_glusterfs_nfs_server_type:
+
+# Volume layout Options (required)
+# If the glusterfs server requires remote ssh, then you need to fill
+# in 'manila_glusterfs_servers', ssh user 'manila_glusterfs_ssh_user', and ssh password
+# 'manila_glusterfs_ssh_password'.
+# 'manila_glusterfs_servers' value List of GlusterFS servers which provide volumes,
+# the format is for example:
+#   - 10.0.1.1
+#   - 10.0.1.2
+#manila_glusterfs_servers:
+#manila_glusterfs_ssh_user:
+#manila_glusterfs_ssh_password:
+# Used to filter GlusterFS volumes for share creation.
+# Examples: manila-share-volume-\\d+$, manila-share-volume-#{size}G-\\d+$;
+#manila_glusterfs_volume_pattern:
+
+# Directory layout Options
+# If the glusterfs server is on the local node of the manila share,
+# it’s of the format <glustervolserver>:/<glustervolid>
+# If the glusterfs server is on a remote node,
+# it’s of the format <username>@<glustervolserver>:/<glustervolid> ,
+# and define 'manila_glusterfs_ssh_password'
+#manila_glusterfs_target:
+#manila_glusterfs_mount_point_base:
+
+################################
+# Swift - Object Storage Options
+################################
+# Swift expects block devices to be available for storage. Two types of storage
+# are supported: 1 - storage device with a special partition name and filesystem
+# label, 2 - unpartitioned disk  with a filesystem. The label of this filesystem
+# is used to detect the disk which Swift will be using.
+
+# Swift support two matching modes, valid options are [ prefix, strict ]
+#swift_devices_match_mode: "strict"
+
+# This parameter defines matching pattern: if "strict" mode was selected,
+# for swift_devices_match_mode then swift_device_name should specify the name of
+# the special swift partition for example: "KOLLA_SWIFT_DATA", if "prefix" mode was
+# selected then swift_devices_name should specify a pattern which would match to
+# filesystems' labels prepared for swift.
+#swift_devices_name: "KOLLA_SWIFT_DATA"
+
+# Configure swift upgrade option, due to currently kolla support
+# two upgrade ways for swift: legacy_upgrade and rolling_upgrade
+# The variable "swift_enable_rolling_upgrade: yes" is meaning rolling_upgrade
+# were enabled and opposite
+# Rolling upgrade were enable by default
+#swift_enable_rolling_upgrade: "yes"
+
+
+################################################
+# Tempest - The OpenStack Integration Test Suite
+################################################
+# The following values must be set when enabling tempest
+#tempest_image_id:
+#tempest_flavor_ref_id:
+#tempest_public_network_id:
+#tempest_floating_network_name:
+
+# tempest_image_alt_id: "{{ tempest_image_id }}"
+# tempest_flavor_ref_alt_id: "{{ tempest_flavor_ref_id }}"
+
+###################################
+# VMware - OpenStack VMware support
+###################################
+#vmware_vcenter_host_ip:
+#vmware_vcenter_host_username:
+#vmware_vcenter_host_password:
+#vmware_datastore_name:
+#vmware_vcenter_name:
+#vmware_vcenter_cluster_name:
+
+############
+# Prometheus
+############
+#enable_prometheus_server: "{{ enable_prometheus | bool }}"
+#enable_prometheus_haproxy_exporter: "{{ enable_haproxy | bool }}"
+#enable_prometheus_mysqld_exporter: "{{ enable_mariadb | bool }}"
+#enable_prometheus_node_exporter: "{{ enable_prometheus | bool }}"
+#enable_prometheus_cadvisor: "{{ enable_prometheus | bool }}"
+#enable_prometheus_memcached: "{{ enable_prometheus | bool }}"
+#enable_prometheus_alertmanager: "{{ enable_prometheus | bool }}"
+#enable_prometheus_ceph_mgr_exporter: "no"
+#enable_prometheus_openstack_exporter: "{{ enable_prometheus | bool }}"
+#enable_prometheus_elasticsearch_exporter: "{{ enable_prometheus | bool and enable_elasticsearch | bool }}"
+#enable_prometheus_blackbox_exporter: "{{ enable_prometheus | bool }}"
+
+# List of extra parameters passed to prometheus. You can add as many to the list.
+#prometheus_cmdline_extras:
+
+# Example of setting endpoints for prometheus ceph mgr exporter.
+# You should add all ceph mgr's in your external ceph deployment.
+#prometheus_ceph_mgr_exporter_endpoints:
+#  - host1:port1
+#  - host2:port2
+
+# Whether to keep using Prometheus server v1 (due to no data-preserving migration path to v2)
+#prometheus_use_v1: no
+
+#########
+# Freezer
+#########
+# Freezer can utilize two different database backends, elasticsearch or mariadb.
+# Elasticsearch is preferred, however it is not compatible with the version deployed
+# by kolla-ansible. You must first setup an external elasticsearch with 2.3.0.
+# By default, kolla-ansible deployed mariadb is the used database backend.
+#freezer_database_backend: "mariadb"
+
+##########
+# Telegraf
+##########
+# Configure telegraf to use the docker daemon itself as an input for
+# telemetry data.
+#telegraf_enable_docker_input: "no"
+
+##########################################
+# Octavia - openstack loadbalancer Options
+##########################################
+# Whether to run Kolla Ansible's automatic configuration for Octavia.
+# NOTE: if you upgrade from Ussuri, you must set `octavia_auto_configure` to `no`
+# and keep your other Octavia config like before.
+#octavia_auto_configure: yes
+
+# Octavia amphora flavor.
+# See os_nova_flavor for details. Supported parameters:
+# - flavorid (optional)
+# - is_public (optional)
+# - name
+# - vcpus
+# - ram
+# - disk
+# - ephemeral (optional)
+# - swap (optional)
+# - extra_specs (optional)
+#octavia_amp_flavor:
+#  name: "amphora"
+#  is_public: no
+#  vcpus: 1
+#  ram: 1024
+#  disk: 5
+
+# Octavia security groups. lb-mgmt-sec-grp is for amphorae.
+#octavia_amp_security_groups:
+#    mgmt-sec-grp:
+#      name: "lb-mgmt-sec-grp"
+#      rules:
+#        - protocol: icmp
+#        - protocol: tcp
+#          src_port: 22
+#          dst_port: 22
+#        - protocol: tcp
+#          src_port: "{{ octavia_amp_listen_port }}"
+#          dst_port: "{{ octavia_amp_listen_port }}"
+
+# Octavia management network.
+# See os_network and os_subnet for details. Supported parameters:
+# - external (optional)
+# - mtu (optional)
+# - name
+# - provider_network_type (optional)
+# - provider_physical_network (optional)
+# - provider_segmentation_id (optional)
+# - shared (optional)
+# - subnet
+# The subnet parameter has the following supported parameters:
+# - allocation_pool_start (optional)
+# - allocation_pool_end (optional)
+# - cidr
+# - enable_dhcp (optional)
+# - gateway_ip (optional)
+# - name
+# - no_gateway_ip (optional)
+# - ip_version (optional)
+# - ipv6_address_mode (optional)
+# - ipv6_ra_mode (optional)
+#octavia_amp_network:
+#  name: lb-mgmt-net
+#  shared: false
+#  subnet:
+#    name: lb-mgmt-subnet
+#    cidr: "{{ octavia_amp_network_cidr }}"
+#    no_gateway_ip: yes
+#    enable_dhcp: yes
+
+# Octavia management network subnet CIDR.
+#octavia_amp_network_cidr: 10.1.0.0/24
+
+#octavia_amp_image_tag: "amphora"
+
+# Load balancer topology options are [ SINGLE, ACTIVE_STANDBY ]
+#octavia_loadbalancer_topology: "SINGLE"
+
+# The following variables are ignored as along as `octavia_auto_configure` is set to `yes`.
+#octavia_amp_image_owner_id:
+#octavia_amp_boot_network_list:
+#octavia_amp_secgroup_list:
+#octavia_amp_flavor_id:
+
+####################
+# Corosync options
+####################
+
+# this is UDP port
+#hacluster_corosync_port: 5405
+```
+
+##### multinode
+
+```conf
+# These initial groups are the only groups required to be modified. The
+# additional groups are for more controller1 of the environment.
+[controller1]
+# These hostname must be resolvable from your deployment host
+controller1
+
+# The above can also be specified as follows:
+#controller1[01:03]     ansible_user=kolla
+
+# The network nodes are where your l3-agent and loadbalancers will run
+# This can be the same as a host in the controller1 group
+[network]
+controller1
+
+[compute]
+controller1
+
+[monitoring]
+
+
+# When compute nodes and controller1 nodes use different interfaces,
+# you need to comment out "api_interface" and other interfaces from the globals.yml
+# and specify like below:
+#controller1 neutron_external_interface=eth0 api_interface=em1 storage_interface=em1 tunnel_interface=em1
+
+[storage]
+controller1
+
+[deployment]
+localhost       ansible_connection=local
+
+[baremetal:children]
+
+
+[tls-backend:children]
+
+# You can explicitly specify which hosts run each project by updating the
+# groups in the sections below. Common services are grouped together.
+
+[common:children]
+
+
+[chrony-server:children]
+
+[chrony:children]
+
+
+[collectd:children]
+
+
+[grafana:children]
+
+
+
+[etcd:children]
+controller1
+
+
+[influxdb:children]
+controller1
+
+[prometheus:children]
+
+
+
+[kafka:children]
+controller1
+
+
+[kibana:children]
+
+
+
+[telegraf:children]
+
+
+[elasticsearch:children]
+
+[hacluster:children]
+
+
+[hacluster-remote:children]
+
+
+[haproxy:children]
+
+
+[mariadb:children]
+
+controller1
+
+[rabbitmq:children]
+controller1
+
+[outward-rabbitmq:children]
+
+
+[qdrouterd:children]
+
+
+controller1
+
+[monasca-agent:children]
+
+
+
+[monasca:children]
+controller1
+
+[storm:children]
+
+controller1
+
+[keystone:children]
+controller1
+
+[glance:children]
+controller1
+
+
+[nova:children]
+controller1
+
+[neutron:children]
+controller1
+
+[openvswitch:children]
+controller1
+
+[cinder:children]
+controller1
+
+
+[cloudkitty:children]
+controller1
+
+
+[freezer:children]
+controller1
+
+
+[memcached:children]
+controller1
+
+[horizon:children]
+controller1
+
+
+[swift:children]
+controller1
+
+
+[barbican:children]
+controller1
+
+[heat:children]
+controller1
+
+[murano:children]
+controller1
+
+[solum:children]
+controller1
+
+[ironic:children]
+controller1
+
+[magnum:children]
+controller1
+
+[sahara:children]
+controller1
+
+[mistral:children]
+controller1
+
+[manila:children]
+controller1
+
+[ceilometer:children]
+controller1
+
+[aodh:children]
+controller1
+
+[cyborg:children]
+controller1
+
+[panko:children]
+controller1
+
+[gnocchi:children]
+controller1
+
+[tacker:children]
+controller1
+
+[trove:children]
+controller1
+
+# Tempest
+[tempest:children]
+controller1
+
+[senlin:children]
+controller1
+
+[vmtp:children]
+controller1
+
+[vitrage:children]
+controller1
+
+[watcher:children]
+controller1
+
+[rally:children]
+controller1
+
+[octavia:children]
+controller1
+
+[designate:children]
+controller1
+
+[placement:children]
+controller1
+
+[bifrost:children]
+deployment
+
+[zookeeper:children]
+controller1
+
+[zun:children]
+controller1
+
+[skydive:children]
+monitoring
+
+[redis:children]
+controller1
+
+[blazar:children]
+controller1
+
+# Additional controller1 implemented here. These groups allow you to controller1 which
+# services run on which hosts at a per-service level.
+#
+# Word of caution: Some services are required to run on the same host to
+# function appropriately. For example, neutron-metadata-agent must run on the
+# same host as the l3-agent and (depending on configuration) the dhcp-agent.
+
+# Common
+[cron:children]
+controller1
+
+
+[fluentd:children]
+controller1
+
+
+[kolla-logs:children]
+controller1
+
+
+[kolla-toolbox:children]
+controller1
+
+
+# Elasticsearch Curator
+[elasticsearch-curator:children]
+
+controller1
+
+# Glance
+[glance-api:children]
+controller1
+
+# Nova
+[nova-api:children]
+controller1
+
+[nova-conductor:children]
+controller1
+
+[nova-super-conductor:children]
+controller1
+
+[nova-novncproxy:children]
+controller1
+
+[nova-scheduler:children]
+controller1
+
+
+[nova-spicehtml5proxy:children]
+controller1
+
+[nova-compute-ironic:children]
+controller1
+
+[nova-serialproxy:children]
+controller1
+
+# Neutron
+[neutron-server:children]
+controller1
+
+[neutron-dhcp-agent:children]
+controller1
+
+
+[neutron-l3-agent:children]
+controller1
+
+
+[neutron-metadata-agent:children]
+controller1
+
+
+[neutron-ovn-metadata-agent:children]
+controller1
+
+
+[neutron-bgp-dragent:children]
+controller1
+
+
+[neutron-infoblox-ipam-agent:children]
+controller1
+
+
+[neutron-metering-agent:children]
+controller1
+
+
+[ironic-neutron-agent:children]
+controller1
+
+
+# Cinder
+[cinder-api:children]
+controller1
+
+
+[cinder-backup:children]
+controller1
+
+
+[cinder-scheduler:children]
+controller1
+
+
+[cinder-volume:children]
+controller1
+
+
+# Cloudkitty
+[cloudkitty-api:children]
+controller1
+
+
+[cloudkitty-processor:children]
+controller1
+
+
+# Freezer
+[freezer-api:children]
+controller1
+
+
+[freezer-scheduler:children]
+controller1
+
+
+# iSCSI
+[iscsid:children]
+controller1
+
+
+[tgtd:children]
+controller1
+
+
+# Manila
+[manila-api:children]
+controller1
+
+
+[manila-scheduler:children]
+controller1
+
+
+[manila-share:children]
+controller1
+
+
+[manila-data:children]
+controller1
+
+
+# Swift
+[swift-proxy-server:children]
+controller1
+
+
+[swift-account-server:children]
+storage
+
+[swift-container-server:children]
+storage
+
+[swift-object-server:children]
+storage
+
+# Barbican
+[barbican-api:children]
+controller1
+
+
+[barbican-keystone-listener:children]
+controller1
+
+
+[barbican-worker:children]
+controller1
+
+
+# Heat
+[heat-api:children]
+controller1
+
+
+[heat-api-cfn:children]
+controller1
+
+[heat-engine:children]
+controller1
+
+# Murano
+[murano-api:children]
+controller1
+
+
+[murano-engine:children]
+controller1
+
+
+# Monasca
+[monasca-agent-collector:children]
+controller1
+
+[monasca-agent-forwarder:children]
+controller1
+
+[monasca-agent-statsd:children]
+controller1
+
+[monasca-api:children]
+controller1
+
+
+[monasca-grafana:children]
+controller1
+
+
+[monasca-log-transformer:children]
+controller1
+
+
+[monasca-log-persister:children]
+controller1
+
+
+[monasca-log-metrics:children]
+controller1
+
+
+[monasca-thresh:children]
+monasca
+
+[monasca-notification:children]
+monasca
+
+[monasca-persister:children]
+monasca
+
+# Storm
+[storm-worker:children]
+storm
+
+[storm-nimbus:children]
+storm
+
+# Ironic
+[ironic-api:children]
+ironic
+
+[ironic-conductor:children]
+ironic
+
+[ironic-inspector:children]
+ironic
+
+[ironic-pxe:children]
+ironic
+
+[ironic-ipxe:children]
+ironic
+
+# Magnum
+[magnum-api:children]
+magnum
+
+[magnum-conductor:children]
+magnum
+
+# Sahara
+[sahara-api:children]
+sahara
+
+[sahara-engine:children]
+sahara
+
+# Solum
+[solum-api:children]
+solum
+
+[solum-worker:children]
+solum
+
+[solum-deployer:children]
+solum
+
+[solum-conductor:children]
+solum
+
+[solum-application-deployment:children]
+solum
+
+[solum-image-builder:children]
+solum
+
+# Mistral
+[mistral-api:children]
+mistral
+
+[mistral-executor:children]
+mistral
+
+[mistral-engine:children]
+mistral
+
+[mistral-event-engine:children]
+mistral
+
+# Ceilometer
+[ceilometer-central:children]
+ceilometer
+
+[ceilometer-notification:children]
+ceilometer
+
+[ceilometer-compute:children]
+compute
+
+[ceilometer-ipmi:children]
+compute
+
+# Aodh
+[aodh-api:children]
+aodh
+
+[aodh-evaluator:children]
+aodh
+
+[aodh-listener:children]
+aodh
+
+[aodh-notifier:children]
+aodh
+
+# Cyborg
+[cyborg-api:children]
+cyborg
+
+[cyborg-agent:children]
+compute
+
+[cyborg-conductor:children]
+cyborg
+
+# Panko
+[panko-api:children]
+panko
+
+# Gnocchi
+[gnocchi-api:children]
+gnocchi
+
+[gnocchi-statsd:children]
+gnocchi
+
+[gnocchi-metricd:children]
+gnocchi
+
+# Trove
+[trove-api:children]
+trove
+
+[trove-conductor:children]
+trove
+
+[trove-taskmanager:children]
+trove
+
+# Multipathd
+[multipathd:children]
+compute
+storage
+
+# Watcher
+[watcher-api:children]
+watcher
+
+[watcher-engine:children]
+watcher
+
+[watcher-applier:children]
+watcher
+
+# Senlin
+[senlin-api:children]
+senlin
+
+[senlin-conductor:children]
+senlin
+
+[senlin-engine:children]
+senlin
+
+[senlin-health-manager:children]
+senlin
+
+# Octavia
+[octavia-api:children]
+octavia
+
+[octavia-driver-agent:children]
+octavia
+
+[octavia-health-manager:children]
+octavia
+
+[octavia-housekeeping:children]
+octavia
+
+[octavia-worker:children]
+octavia
+
+# Designate
+[designate-api:children]
+designate
+
+[designate-central:children]
+designate
+
+[designate-producer:children]
+designate
+
+[designate-mdns:children]
+network
+
+[designate-worker:children]
+designate
+
+[designate-sink:children]
+designate
+
+[designate-backend-bind9:children]
+designate
+
+# Placement
+[placement-api:children]
+controller1
+
+# Zun
+[zun-api:children]
+zun
+
+[zun-wsproxy:children]
+zun
+
+[zun-compute:children]
+
+[zun-cni-daemon:children]
+
+# Skydive
+[skydive-analyzer:children]
+
+[skydive-agent:children]
+
+# Tacker
+[tacker-server:children]
+
+[tacker-conductor:children]
+
+# Vitrage
+[vitrage-api:children]
+
+[vitrage-notifier:children]
+
+[vitrage-graph:children]
+
+[vitrage-ml:children]
+
+[vitrage-persistor:children]
+
+# Blazar
+[blazar-api:children]
+
+[blazar-manager:children]
+
+# Prometheus
+[prometheus-node-exporter:children]
+
+[prometheus-mysqld-exporter:children]
+controller1
+
+
+[prometheus-haproxy-exporter:children]
+controller1
+
+
+[prometheus-memcached-exporter:children]
+controller1
+
+
+[prometheus-cadvisor:children]
+controller1
+
+
+[prometheus-alertmanager:children]
+monitoring
+
+[prometheus-openstack-exporter:children]
+monitoring
+
+[prometheus-elasticsearch-exporter:children]
+elasticsearch
+
+[prometheus-blackbox-exporter:children]
+monitoring
+
+[masakari-api:children]
+controller1
+
+[masakari-engine:children]
+controller1
+
+[masakari-hostmonitor:children]
+controller1
+
+[masakari-instancemonitor:children]
+
+[ovn-controller1ler:children]
+
+[ovn-controller1ler-compute:children]
+
+[ovn-controller1ler-network:children]
+
+[ovn-database:children]
+controller1
+
+[ovn-northd:children]
+
+[ovn-nb-db:children]
+
+[ovn-sb-db:children]
+
+```
+
+```yml
+
+[control]
+controller1
+# 多个连续节点可以使用: controller[1:3]
+    
+# 网络节点是DHCP/L3运行的节点，通常和控制节点共用
+[network]
+controller1
+    
+# 计算节点
+[inner-compute]
+controller1
+[external-compute]
+[compute:children]
+# 监控服务节点，通常和控制节点共用
+[monitoring]
+controller1    
+# 存储节点，cinder volume服务运行节点
+[storage]
+controller1
+```
+
+#### password
+
+kolla-genpwd
+cd /etc/kolla/
+vim passwords.yml
+
+##### 修改密码
+
+keystone_admin_password: admin
+
+#### 修改虚拟机为qemu模拟的
+
+因为虚拟机启动虚拟机，所以 修改nova虚拟机为qemu模拟的,否则的话可选参数为kvm
+
+vim /etc/ansible/ansible.cfg
+
+mkdir -p /etc/kolla/config/nova
+cd /etc/kolla/config/nova
+vim nova-compute.conf
+
+[libvirt]
+virt_type = qemu
+cpu_mode = none
+
+
+#### 拉取编译的镜像
+
+kolla-ansible pull
+
+检查是否有错
+
+kolla-ansible -i /etc/kolla/multinode prechecks
+
+## 执行部署
+
+部署前检查:
+
+    kolla-ansible -i /etc/kolla/multinode  prechecks
+
+检查如果没有错误，则执行如下命令部署:
+
+    kolla-ansible -i /etc/kolla/multinode deploy
+
+部署成功后，执行命令生成CLI openrc文件`/etc/kolla/admin-openrc.sh`:
+
+    kolla-ansible -i /etc/kolla/multinode  post-deploy
+
+## 日志管理
+
+由于某些容器日志会持续增长，为了防止日志撑爆系统，需要启用docker的log rotate功能定期清理日志
+
+新建文件： `/etc/docker/daemon.json`
+
+```
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3" 
+  }
+}
+```
+
+### OpenStack 使用
+
+openstack 提供了两种调用方式
+
+命令行 client 与 rest api
+
+以下是分别调用的方式
+
+### client 使用
+
+部署成功后，执行命令生成CLI openrc文件`/etc/kolla/admin-openrc.sh`:
+
+    kolla-ansible -i /etc/kolla/multinode  post-deploy
+
+source /etc/kolla/admin-openrc.sh
+
+在 kolla-ansible tools 文件夹下执行 初始化脚本
+./init-runonce
+拉取 cirros镜像 和相应基本资源
+
+执行
+openstack server create     --image cirros     --flavor m1.tiny     --key-name mykey     --network demo-net     demo1
+
+openstack server create     --image cirros     --flavor m1.tiny     --key-name mykey     --network public1     demo2
+
+
+创建 名为 demo 1的虚拟机器
+
+### dashboard使用
+
+服务器需要设置访问端口
+
+ufw allow 80 6080
+
+80 dashboard
+6080 novnc
+
+因为我vip设置的是 10.131.165.195
+
+访问
+
+http://10.131.165.195/auth/login/
+
+admin
+admin
+
+即可
+
+### rest api 使用
+
+
+### 参考文档
+
+[kolla 部署 all in one](https://www.cnblogs.com/zjz20/p/12167152.html)
+
+[](https://www.cnblogs.com/chaofan-/p/11714741.html)
+[Openstack容器化部署研究之：Kolla离线制作Openstack服务的Docker容器镜像](https://blog.csdn.net/madmanvswarrior/article/details/68953831)
+
+[](https://kifarunix.com/deploy-all-in-one-openstack-with-kolla-ansible-on-ubuntu-18-04/)
+
+[](https://www.cnblogs.com/silvermagic/p/7665975.html)
+
+[](https://www.dazhuanlan.com/yakultlesssugar/topics/1351271)
+[自签名docker私有register](https://www.jb51.net/article/156168.htm)
+[](https://www.jianshu.com/p/b961c98614e4)
+[ka](https://docs.openstack.org/kolla-ansible/wallaby/)
+[openstack 官方安装指南](https://docs.openstack.org/install-guide/)
+
+[](https://docs.openstack.org/wallaby/index.html)
+
+[](https://docs.openstack.org/project-deploy-guide/kolla-ansible/wallaby/quickstart.html#deployment)
+
+[](https://docs.openstack.org/kolla/ussuri/admin/image-building.html)
+
+[](https://www.jianshu.com/p/b961c98614e4)
+[](https://blog.csdn.net/weixin_42489062/article/details/89351735vm)
+
+### 出错参考
+
+#### 1.
+refusing to convert from directory to symlink for /var/log/kolla
+删除 /var/log/kolla
+再重新部署
+
+### 2.
+TASK [haproxy : Checking if kolla_internal_vip_address and kolla_external_vip_address are not pingable from any node]
+配置文件 childen部分写错了得改为 controller1
+
+
+### ip 参考
+
+sudo vi /etc/netplan/50-cloud-init.yaml
+
+
+假设IP地址修改为192.168.1.100，子网掩码24位即255.255.255.0，网关设置为192.168.1.1，DNS1：223.5.5.5，DNS2：223.6.6.6
+
+network:
+    ethernets:
+        ens33:
+            dhcp4: no
+            addresses: [192.168.1.100/24]
+            optional: true
+            gateway4: 192.168.1.1
+            nameservers:
+                    addresses: [223.5.5.5,223.6.6.6]
+ 
+    version: 2
+
+
+   连接特定的 DNS 后缀 . . . . . . . :
+   本地链接 IPv6 地址. . . . . . . . : fe80::b8ab:e6f3:37c4:37f7%25
+   IPv4 地址 . . . . . . . . . . . . : 10.131.165.203
+   子网掩码  . . . . . . . . . . . . : 255.255.255.0
+   默认网关. . . . . . . . . . . . . : 10.131.165.254
+
+
+假设IP地址修改为10.131.165.195，子网掩码24位即255.255.255.0，网关设置为192.168.1.1，DNS1：10.138.1.8
+，DNS2：218.104.111.114
+
+network:
+    ethernets:
+        ens36:
+            dhcp4: no
+            addresses: [10.131.165.195/24]
+            optional: true
+            gateway4: 10.131.165.254
+            nameservers:
+                    addresses: [10.138.1.8,218.104.111.114]
+ 
+    version: 2
+
+
+sudo netplan apply
+
+
+network:
+    ethernets:
+        ens36:
+            dhcp4: no
+            addresses: [10.131.165.32/24]
+            optional: true
+            gateway4: 10.131.165.254
+            nameservers:
+                    addresses: [10.138.1.8,218.104.111.114]
+ 
+    version: 2
+
+brd 10.131.165.255
